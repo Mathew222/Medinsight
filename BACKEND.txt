@@ -1,0 +1,165 @@
+from flask import Flask, send_from_directory, request, jsonify
+from flask_cors import CORS
+from dotenv import load_dotenv
+import os
+import logging
+import google.generativeai as genai
+import openai
+import requests
+import PyPDF2
+import pandas as pd
+import docx
+import pytesseract
+import cv2
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Flask
+app = Flask(__name__, static_folder="dist")
+CORS(app)
+
+# Logging setup
+logging.basicConfig(level=logging.DEBUG)
+
+# Set the path to tesseract.exe
+pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+
+# Configure API Key
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+genai.configure(api_key=GEMINI_API_KEY)
+openai.api_key = OPENAI_API_KEY
+
+# ICD-10 API Credentials
+ICD10_CLIENT_ID = os.getenv("ICD10_CLIENT_ID")
+ICD10_CLIENT_SECRET = os.getenv("ICD10_CLIENT_SECRET")
+
+# Initialize the model
+MODEL_ID = "gemini-2.0-flash-exp"
+chat_instance = genai.GenerativeModel(MODEL_ID)
+chat_session = chat_instance.start_chat(history=[])
+
+chat_history = []
+
+def chat_with_model(prompt):
+    global chat_history
+    medical_instruction = (
+        "You are a medical AI assistant. Respond ONLY to medical queries.\n"
+        "If a query is not related to medicine, reply: 'I am here to help with medical queries only.'\n"
+        "Provide responses in a clear, bullet-point format.\n"
+        "Ensure each item is concise and easy to understand.\n"
+        "Each bullet point must start with a '*' and be on a new line.\n"
+        "Avoid using bold symbols or unnecessary formatting."
+    )
+    chat_history.append({"role": "user", "content": prompt})
+    response = chat_session.send_message(f"{medical_instruction}\nUser: {prompt}\nHistory: {chat_history}")
+    chat_history.append({"role": "assistant", "content": response.text})
+    return response.text
+
+
+def extract_text(file_path):
+    extracted_text = ""
+    if file_path.endswith(".pdf"):
+        with open(file_path, "rb") as f:
+            pdf_reader = PyPDF2.PdfReader(f)
+            for page in pdf_reader.pages:
+                extracted_text += page.extract_text() or ""
+    elif file_path.endswith(".docx"):
+        doc = docx.Document(file_path)
+        extracted_text = "\n".join([para.text for para in doc.paragraphs])
+    elif file_path.endswith(".xlsx"):
+        df = pd.read_excel(file_path)
+        extracted_text = df.to_string()
+    elif file_path.lower().endswith((".png", ".jpg", ".jpeg")):
+        image = cv2.imread(file_path)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        text = pytesseract.image_to_string(gray)
+        extracted_text = text.strip()
+    return extracted_text
+
+
+def analyze_text(text):
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": (
+                "You are a medical AI assistant.\n"
+                "Extract key medical data, summarize results, and explain them concisely in bullet points.\n"
+                "Each bullet point must start with a '*' and be on a new line.\n"
+                "Ensure each point is clear and easy to understand."
+            )},
+            {"role": "user", "content": text},
+        ]
+    )
+    return response["choices"][0]["message"]["content"]
+
+
+def get_icd10_classification(medical_terms):
+    url = "https://icd10api.com/api/lookup"
+    headers = {"Content-Type": "application/json"}
+    auth = (ICD10_CLIENT_ID, ICD10_CLIENT_SECRET)
+    response = requests.post(url, json={"query": medical_terms}, auth=auth)
+    return response.json() if response.status_code == 200 else {}
+
+
+@app.route("/analyze", methods=["POST"])
+def analyze_report():
+    data = request.json
+    file_path = data.get("file_path")
+    if not file_path or not os.path.exists(file_path):
+        return jsonify({"error": "File not found"}), 400
+    extracted_text = extract_text(file_path)
+    if not extracted_text:
+        return jsonify({"error": "No text extracted from document"}), 400
+    analysis_result = analyze_text(extracted_text)
+    icd10_result = get_icd10_classification(extracted_text)
+    return jsonify({
+        "message": "Analysis complete",
+        "analysis": analysis_result,
+        "icd10_classification": icd10_result,
+    }), 200
+
+
+@app.route("/")
+def serve_frontend():
+    return send_from_directory("dist", "index.html")
+
+
+@app.route("/<path:path>")
+def serve_static_files(path):
+    return send_from_directory("dist", path)
+
+
+@app.route("/api/chat", methods=["POST"])
+def chat_api():
+    user_message = request.json.get("message")
+    if not user_message:
+        return jsonify({"error": "No message provided"}), 400
+    try:
+        response_text = chat_with_model(user_message)
+        return jsonify({"response": response_text})
+    except Exception as e:
+        logging.error(f"Error: {e}")
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+
+
+@app.route("/upload", methods=["POST"])
+def upload_file():
+    if "file" not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "No selected file"}), 400
+    file_path = os.path.join(app.config["UPLOAD_FOLDER"], file.filename)
+    file.save(file_path)
+    return jsonify({"message": "File uploaded successfully", "file_path": file_path}), 200
+
+
+if __name__ == "__main__":
+    app.run(debug=os.getenv("FLASK_DEBUG", "false").strip().lower() in ["1", "true"])
