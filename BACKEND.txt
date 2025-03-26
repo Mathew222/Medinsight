@@ -1,165 +1,269 @@
-from flask import Flask, send_from_directory, request, jsonify
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 import logging
 import google.generativeai as genai
-import openai
-import requests
-import PyPDF2
 import pandas as pd
 import docx
 import pytesseract
 import cv2
+import fitz  # PyMuPDF
+import pdfplumber
+import pathlib
+import json
+import re
+import numpy as np
 
 # Load environment variables
 load_dotenv()
 
 # Initialize Flask
-app = Flask(__name__, static_folder="dist")
+app = Flask(__name__)
 CORS(app)
 
 # Logging setup
 logging.basicConfig(level=logging.DEBUG)
 
-# Set the path to tesseract.exe
+# Set the path to Tesseract OCR
 pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
 
-# Configure API Key
+# Configure API Keys
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not GEMINI_API_KEY:
+    raise ValueError("❌ GEMINI_API_KEY is missing in .env file.")
+
+# Configure Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
-openai.api_key = OPENAI_API_KEY
+gemini_model = genai.GenerativeModel("gemini-2.0-flash-exp")
 
-# ICD-10 API Credentials
-ICD10_CLIENT_ID = os.getenv("ICD10_CLIENT_ID")
-ICD10_CLIENT_SECRET = os.getenv("ICD10_CLIENT_SECRET")
+# Uploads directory
+UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-# Initialize the model
-MODEL_ID = "gemini-2.0-flash-exp"
-chat_instance = genai.GenerativeModel(MODEL_ID)
-chat_session = chat_instance.start_chat(history=[])
+# -------------------- Utility Functions --------------------
+# Initialize chat session
+chat_session = gemini_model.start_chat(history=[])
 
-chat_history = []
+def preprocess_image(image):
+    """Preprocesses an image for better OCR."""
+
+    # Convert to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Noise removal
+    gray = cv2.medianBlur(gray, 3)  # Adjust kernel size as needed
+
+    # Thresholding to binarize
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+    # Dilation and Erosion to remove noise
+    kernel = np.ones((2, 2), np.uint8)
+    thresh = cv2.dilate(thresh, kernel, iterations=1)
+    thresh = cv2.erode(thresh, kernel, iterations=1)
+    return thresh
+
+def extract_text_from_image(file_path):
+    """Extracts text from an image using OCR with preprocessing."""
+    try:
+        image = cv2.imread(file_path)
+        if image is None:
+            print(f"Error: Could not read image at {file_path}")  # Debugging
+            return ""
+        preprocessed_image = preprocess_image(image)
+        text = pytesseract.image_to_string(preprocessed_image, config='--psm 6 --oem 3').strip()
+        return text
+    except Exception as e:
+        print(f"Error during OCR: {e}")  # Debugging
+        return ""
 
 def chat_with_model(prompt):
-    global chat_history
+    """Chat with the medical AI model."""
+    global chat_session
+
     medical_instruction = (
         "You are a medical AI assistant. Respond ONLY to medical queries.\n"
         "If a query is not related to medicine, reply: 'I am here to help with medical queries only.'\n"
         "Provide responses in a clear, bullet-point format.\n"
         "Ensure each item is concise and easy to understand.\n"
-        "Each bullet point must start with a '*' and be on a new line.\n"
-        "Avoid using bold symbols or unnecessary formatting."
+        "Each bullet point must start with a '*' and be on a new line."
     )
-    chat_history.append({"role": "user", "content": prompt})
-    response = chat_session.send_message(f"{medical_instruction}\nUser: {prompt}\nHistory: {chat_history}")
-    chat_history.append({"role": "assistant", "content": response.text})
-    return response.text
+
+    try:
+        response = chat_session.send_message(f"{medical_instruction}\nUser: {prompt}")
+
+        if hasattr(response, "text"):
+            return response.text.strip()
+        else:
+            return "❌ No response from AI."
+
+    except Exception as e:
+        logging.error(f"❌ AI Chatbot Error: {e}")
+        return "❌ AI chatbot is currently unavailable. Please try again later."
 
 
 def extract_text(file_path):
+    """Extract text from PDFs, DOCX, Images, and Excel files."""
     extracted_text = ""
-    if file_path.endswith(".pdf"):
-        with open(file_path, "rb") as f:
-            pdf_reader = PyPDF2.PdfReader(f)
-            for page in pdf_reader.pages:
-                extracted_text += page.extract_text() or ""
-    elif file_path.endswith(".docx"):
-        doc = docx.Document(file_path)
-        extracted_text = "\n".join([para.text for para in doc.paragraphs])
-    elif file_path.endswith(".xlsx"):
-        df = pd.read_excel(file_path)
-        extracted_text = df.to_string()
-    elif file_path.lower().endswith((".png", ".jpg", ".jpeg")):
-        image = cv2.imread(file_path)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        text = pytesseract.image_to_string(gray)
-        extracted_text = text.strip()
-    return extracted_text
+    ext = pathlib.Path(file_path).suffix.lower()
+
+    try:
+        if ext == ".pdf":
+            with pdfplumber.open(file_path) as pdf:
+                extracted_text = "\n".join([page.extract_text() or "" for page in pdf.pages])
+
+            if not extracted_text.strip():
+                doc = fitz.open(file_path)
+                extracted_text = "\n".join([page.get_text("text") for page in doc])
+                doc.close()
+
+        elif ext == ".docx":
+            doc = docx.Document(file_path)
+            extracted_text = "\n".join([para.text for para in doc.paragraphs])
+
+        elif ext == ".xlsx":
+            df = pd.read_excel(file_path)
+            extracted_text = df.to_string()
+
+        elif ext in [".png", ".jpg", ".jpeg"]:
+            extracted_text = extract_text_from_image(file_path)
+
+        logging.info(f"📄 Extracted Text (first 500 chars): {extracted_text[:500]}...")
+    except Exception as e:
+        logging.error(f"❌ Error extracting text: {e}")
+        return ""
+
+    return extracted_text.strip()
 
 
-def analyze_text(text):
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": (
-                "You are a medical AI assistant.\n"
-                "Extract key medical data, summarize results, and explain them concisely in bullet points.\n"
-                "Each bullet point must start with a '*' and be on a new line.\n"
-                "Ensure each point is clear and easy to understand."
-            )},
-            {"role": "user", "content": text},
-        ]
-    )
-    return response["choices"][0]["message"]["content"]
+def analyze_text_with_gemini(text):
+    """Generate a structured medical summary using Gemini AI and format it for React display."""
+    try:
+        logging.info("🔄 Sending text to Gemini for analysis...")
+
+        prompt = f"""
+        You are a medical AI assistant.  Analyze the following medical report excerpt and provide a detailed and comprehensive summary, even if the provided text is incomplete. Extract as much information as possible from the available text.
+        Return a structured JSON:
+        {{
+            "summary": "A comprehensive summary of the medical report excerpt.",
+            "diagnosis": "Short summary of the diagnosis, if available.",
+            "key_findings": ["Key finding 1", "Key finding 2"],
+            "causes": ["Possible cause 1", "Possible cause 2"],
+            "recommendations": "Medical recommendations, if available.",
+            "precautions": ["Precaution 1", "Precaution 2"],
+            "remedies": ["Suggested remedies and home care, if available."],
+            "important_notes": "Any other important information or special considerations from the report, if available.",
+            "treatment_plan": "Suggested treatment and medications, if available.",
+            "lifestyle_changes": ["Lifestyle advice 1", "Lifestyle advice 2"],
+            "urgent_concerns": "Any urgent concerns or null."
+        }}
+        Report excerpt:
+        {text[:8000]}
+        """
+
+        logging.debug(f"Prompt being sent to Gemini: {prompt[:500]}...")  # Log the beginning of the prompt
+
+        response = gemini_model.generate_content(prompt)
+
+        if hasattr(response, "text"):
+            response_text = response.text.strip()
+            logging.info(f"📝 Gemini Raw Response: {response_text[:500]}...")  # Log only the first 500 chars
+
+            json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+            if json_match:
+                response_text = json_match.group(0).strip()
+
+            try:
+                structured_output = json.loads(response_text)
+                logging.info(f"✅ Structured AI Summary: {structured_output}")
+                return structured_output
+            except json.JSONDecodeError as e:
+                logging.error(f"❌ AI response is not valid JSON: {e}")
+                return {"error": "AI response is not structured JSON", "raw_text": response_text}
+
+        return {"error": "No response from Gemini."}
+
+    except Exception as e:
+        logging.error(f"❌ Gemini API Error: {e}")
+        return {"error": "AI processing failed."}
 
 
-def get_icd10_classification(medical_terms):
-    url = "https://icd10api.com/api/lookup"
-    headers = {"Content-Type": "application/json"}
-    auth = (ICD10_CLIENT_ID, ICD10_CLIENT_SECRET)
-    response = requests.post(url, json={"query": medical_terms}, auth=auth)
-    return response.json() if response.status_code == 200 else {}
+def GeminiSummaryComponent(text):
+    data = analyze_text_with_gemini(text)
+
+    if "error" in data:
+        logging.error(f"Gemini Summary Component Error: {data['error']}")
+        return {"error": data["error"]}
+
+    summary_data = {
+        "Summary": data.get("summary", "N/A"),
+        "Diagnosis": data.get("diagnosis", "N/A"),
+        "Key Findings": ", ".join(data.get("key_findings", [])),
+        "Causes": ", ".join(data.get("causes", [])),
+        "Recommendations": data.get("recommendations", "N/A"),
+        "Precautions": ", ".join(data.get("precautions", [])),
+        "Remedies": ", ".join(data.get("remedies", [])),
+        "Important Notes": data.get("important_notes", "N/A"),
+        "Treatment Plan": data.get("treatment_plan", "N/A"),
+        "Lifestyle Changes": ", ".join(data.get("lifestyle_changes", [])),
+        "Urgent Concerns": data.get("urgent_concerns", "N/A"),
+    }
+
+    return summary_data
+
+
+# -------------------- Flask Routes --------------------
+
+@app.route("/upload", methods=["POST"])
+def upload_file():
+    """Upload a file and save it to the server."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file part"}), 400
+
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "No selected file"}), 400
+
+    file_path = os.path.join(app.config["UPLOAD_FOLDER"], file.filename)
+    file.save(file_path)
+    logging.info(f"✅ File uploaded: {file_path}")
+
+    return jsonify({"message": "File uploaded successfully", "file_path": file_path}), 200
 
 
 @app.route("/analyze", methods=["POST"])
 def analyze_report():
+    """Analyze the uploaded medical report and return structured data."""
     data = request.json
     file_path = data.get("file_path")
+
     if not file_path or not os.path.exists(file_path):
         return jsonify({"error": "File not found"}), 400
+
     extracted_text = extract_text(file_path)
-    if not extracted_text:
-        return jsonify({"error": "No text extracted from document"}), 400
-    analysis_result = analyze_text(extracted_text)
-    icd10_result = get_icd10_classification(extracted_text)
-    return jsonify({
-        "message": "Analysis complete",
-        "analysis": analysis_result,
-        "icd10_classification": icd10_result,
-    }), 200
+    if not extracted_text.strip():
+        return jsonify({"error": "No readable text found"}), 400
+
+    structured_summary = analyze_text_with_gemini(extracted_text)
+
+    return jsonify(structured_summary), 200
 
 
-@app.route("/")
-def serve_frontend():
-    return send_from_directory("dist", "index.html")
+@app.route("/chat", methods=["POST"])
+def chat():
+    """Handle AI chatbot conversation."""
+    data = request.json
+    user_message = data.get("message", "").strip()
 
-
-@app.route("/<path:path>")
-def serve_static_files(path):
-    return send_from_directory("dist", path)
-
-
-@app.route("/api/chat", methods=["POST"])
-def chat_api():
-    user_message = request.json.get("message")
     if not user_message:
-        return jsonify({"error": "No message provided"}), 400
-    try:
-        response_text = chat_with_model(user_message)
-        return jsonify({"response": response_text})
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        return jsonify({"error": "An unexpected error occurred."}), 500
+        return jsonify({"error": "Message cannot be empty"}), 400
+
+    ai_response = chat_with_model(user_message)
+    return jsonify({"response": ai_response})
 
 
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-
-
-@app.route("/upload", methods=["POST"])
-def upload_file():
-    if "file" not in request.files:
-        return jsonify({"error": "No file part"}), 400
-    file = request.files["file"]
-    if file.filename == "":
-        return jsonify({"error": "No selected file"}), 400
-    file_path = os.path.join(app.config["UPLOAD_FOLDER"], file.filename)
-    file.save(file_path)
-    return jsonify({"message": "File uploaded successfully", "file_path": file_path}), 200
-
+# -------------------- Run the Flask App --------------------
 
 if __name__ == "__main__":
-    app.run(debug=os.getenv("FLASK_DEBUG", "false").strip().lower() in ["1", "true"])
+    app.run(debug=True, port=5000)
