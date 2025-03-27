@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session # Import session
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
@@ -14,19 +14,44 @@ import pathlib
 import json
 import re
 import numpy as np
+from io import BytesIO
+from PIL import Image
+import secrets # Import secrets for generating a key
 
 # Load environment variables
 load_dotenv()
 
 # Initialize Flask
 app = Flask(__name__)
-CORS(app)
+CORS(app, supports_credentials=True) # Allow credentials for session cookies
+
+# --- IMPORTANT: Add a Secret Key for Session Management ---
+# In a real application, set this from environment variables or a config file
+# For development, you can generate one:
+app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', secrets.token_hex(16))
+# Ensure you set FLASK_SECRET_KEY in your .env or replace the default
 
 # Logging setup
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.INFO)
 
-# Set the path to Tesseract OCR
-pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+# Set the path to Tesseract OCR (Ensure this is correct for your system)
+try:
+    # Attempt to find Tesseract automatically or use a common path
+    pytesseract.pytesseract.tesseract_cmd = pytesseract.pytesseract.tesseract_cmd or r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe" # Modify if needed
+    # You might need to adjust this based on your OS and installation
+    logging.info(f"Using Tesseract at: {pytesseract.pytesseract.tesseract_cmd}")
+    # Optional: Check if Tesseract is working
+    # try:
+    #     pytesseract.get_tesseract_version()
+    #     logging.info("Tesseract version check successful.")
+    # except Exception as tess_err:
+    #      logging.warning(f"Tesseract check failed: {tess_err}. OCR might not work.")
+except Exception as e:
+     logging.error(f"Error setting up Tesseract path: {e}. Please ensure Tesseract is installed and the path is correct.")
+     # You might want to exit or handle this more gracefully depending on requirements
+     # exit(1) # Example: Exit if Tesseract is crucial
 
 # Configure API Keys
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -35,7 +60,13 @@ if not GEMINI_API_KEY:
 
 # Configure Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.0-flash-exp")
+try:
+    # Using a model potentially better for Q&A over larger context
+    gemini_model = genai.GenerativeModel("gemini-1.5-flash-latest")
+    logging.info("Using gemini-1.5-flash-latest for analysis and chat.")
+except Exception as e:
+    logging.warning(f"Could not initialize gemini-1.5-flash-latest, falling back to gemini-pro. Error: {e}")
+    gemini_model = genai.GenerativeModel("gemini-pro") # Fallback
 
 # Uploads directory
 UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads")
@@ -43,227 +74,517 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 # -------------------- Utility Functions --------------------
-# Initialize chat session
-chat_session = gemini_model.start_chat(history=[])
+# (preprocess_image, extract_text_from_image, extract_text, analyze_text_with_gemini, analyze_image_with_gemini remain mostly the same as before)
+# --- Make sure they are included here ---
 
 def preprocess_image(image):
     """Preprocesses an image for better OCR."""
-
-    # Convert to grayscale
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    # Noise removal
-    gray = cv2.medianBlur(gray, 3)  # Adjust kernel size as needed
-
-    # Thresholding to binarize
-    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-
-    # Dilation and Erosion to remove noise
-    kernel = np.ones((2, 2), np.uint8)
-    thresh = cv2.dilate(thresh, kernel, iterations=1)
-    thresh = cv2.erode(thresh, kernel, iterations=1)
-    return thresh
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.medianBlur(gray, 3)
+        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        kernel = np.ones((1, 1), np.uint8) # Smaller kernel might be better sometimes
+        thresh = cv2.dilate(thresh, kernel, iterations=1)
+        thresh = cv2.erode(thresh, kernel, iterations=1)
+        return thresh
+    except Exception as e:
+        logging.error(f"Error during image preprocessing: {e}")
+        try:
+            return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        except:
+             return None
 
 def extract_text_from_image(file_path):
     """Extracts text from an image using OCR with preprocessing."""
     try:
         image = cv2.imread(file_path)
         if image is None:
-            print(f"Error: Could not read image at {file_path}")  # Debugging
+            logging.error(f"Error: Could not read image at {file_path}")
             return ""
         preprocessed_image = preprocess_image(image)
-        text = pytesseract.image_to_string(preprocessed_image, config='--psm 6 --oem 3').strip()
+        if preprocessed_image is None:
+             logging.error(f"Error: Preprocessing failed for image {file_path}")
+             return ""
+        custom_config = r'--oem 3 --psm 6'
+        text = pytesseract.image_to_string(preprocessed_image, config=custom_config).strip()
+        if not text:
+             logging.warning(f"OCR with PSM 6 yielded no text for {file_path}, trying PSM 3 (Auto)")
+             custom_config = r'--oem 3 --psm 3'
+             text = pytesseract.image_to_string(preprocessed_image, config=custom_config).strip()
         return text
     except Exception as e:
-        print(f"Error during OCR: {e}")  # Debugging
+        logging.error(f"Error during OCR for {file_path}: {e}")
         return ""
-
-def chat_with_model(prompt):
-    """Chat with the medical AI model."""
-    global chat_session
-
-    medical_instruction = (
-        "You are a medical AI assistant. Respond ONLY to medical queries.\n"
-        "If a query is not related to medicine, reply: 'I am here to help with medical queries only.'\n"
-        "Provide responses in a clear, bullet-point format.\n"
-        "Ensure each item is concise and easy to understand.\n"
-        "Each bullet point must start with a '*' and be on a new line."
-    )
-
-    try:
-        response = chat_session.send_message(f"{medical_instruction}\nUser: {prompt}")
-
-        if hasattr(response, "text"):
-            return response.text.strip()
-        else:
-            return "❌ No response from AI."
-
-    except Exception as e:
-        logging.error(f"❌ AI Chatbot Error: {e}")
-        return "❌ AI chatbot is currently unavailable. Please try again later."
-
 
 def extract_text(file_path):
     """Extract text from PDFs, DOCX, Images, and Excel files."""
     extracted_text = ""
     ext = pathlib.Path(file_path).suffix.lower()
+    filename = os.path.basename(file_path)
 
     try:
+        logging.info(f"Attempting to extract text from: {filename} (type: {ext})")
         if ext == ".pdf":
-            with pdfplumber.open(file_path) as pdf:
-                extracted_text = "\n".join([page.extract_text() or "" for page in pdf.pages])
-
-            if not extracted_text.strip():
+            try:
                 doc = fitz.open(file_path)
-                extracted_text = "\n".join([page.get_text("text") for page in doc])
+                extracted_text = "\n".join([page.get_text("text").strip() for page in doc if page.get_text("text")])
                 doc.close()
+                logging.info(f"PyMuPDF extraction successful for {filename}.")
+            except Exception as e_fitz:
+                logging.warning(f"PyMuPDF failed for {filename}: {e_fitz}. Trying pdfplumber...")
+                try:
+                    with pdfplumber.open(file_path) as pdf:
+                        extracted_text = "\n".join([page.extract_text() or "" for page in pdf.pages])
+                    logging.info(f"pdfplumber extraction successful for {filename}.")
+                except Exception as e_plumber:
+                    logging.error(f"Both PyMuPDF and pdfplumber failed for PDF {filename}: {e_plumber}")
+                    extracted_text = ""
+
+            if len(extracted_text.strip()) < 50:
+                logging.warning(f"Extracted text from {filename} seems minimal. It might be image-based or OCR needed.")
 
         elif ext == ".docx":
             doc = docx.Document(file_path)
-            extracted_text = "\n".join([para.text for para in doc.paragraphs])
+            extracted_text = "\n".join([para.text for para in doc.paragraphs if para.text])
+            logging.info(f"Docx extraction successful for {filename}.")
 
         elif ext == ".xlsx":
-            df = pd.read_excel(file_path)
-            extracted_text = df.to_string()
+            df = pd.read_excel(file_path, sheet_name=None)
+            all_text = []
+            for sheet_name, frame in df.items():
+                all_text.append(f"--- Sheet: {sheet_name} ---\n{frame.to_string()}")
+            extracted_text = "\n\n".join(all_text)
+            logging.info(f"Xlsx extraction successful for {filename}.")
 
-        elif ext in [".png", ".jpg", ".jpeg"]:
+        elif ext in [".png", ".jpg", ".jpeg", ".bmp", ".tiff"]:
             extracted_text = extract_text_from_image(file_path)
+            if extracted_text:
+                 logging.info(f"Image OCR successful for {filename}.")
+            else:
+                 logging.warning(f"Image OCR yielded no text for {filename}.")
 
-        logging.info(f"📄 Extracted Text (first 500 chars): {extracted_text[:500]}...")
+        else:
+            logging.warning(f"Unsupported file type for text extraction: {ext}")
+            return ""
+
+        logging.info(f"📄 Extracted Text Length for {filename}: {len(extracted_text)} chars")
+        if extracted_text and len(extracted_text) > 500:
+             logging.debug(f"📄 Extracted Text (first 500 chars): {extracted_text[:500]}...")
+        elif extracted_text:
+             logging.debug(f"📄 Extracted Text: {extracted_text}")
+
+
     except Exception as e:
-        logging.error(f"❌ Error extracting text: {e}")
+        logging.error(f"❌ Error extracting text from {filename}: {e}", exc_info=True)
         return ""
 
     return extracted_text.strip()
 
 
 def analyze_text_with_gemini(text):
-    """Generate a structured medical summary using Gemini AI and format it for React display."""
+    """Generate a structured medical summary using Gemini AI."""
     try:
-        logging.info("🔄 Sending text to Gemini for analysis...")
+        max_chars = 100000 # Adjust based on model and expected document size
+        if len(text) > max_chars:
+            logging.warning(f"Input text length ({len(text)} chars) exceeds limit ({max_chars}), truncating.")
+            text = text[:max_chars]
+
+        logging.info("🔄 Sending text to Gemini for structured analysis...")
 
         prompt = f"""
-        You are a medical AI assistant.  Analyze the following medical report excerpt and provide a detailed and comprehensive summary, even if the provided text is incomplete. Extract as much information as possible from the available text.
-        Return a structured JSON:
-        {{
-            "summary": "A comprehensive summary of the medical report excerpt.",
-            "diagnosis": "Short summary of the diagnosis, if available.",
-            "key_findings": ["Key finding 1", "Key finding 2"],
-            "causes": ["Possible cause 1", "Possible cause 2"],
-            "recommendations": "Medical recommendations, if available.",
-            "precautions": ["Precaution 1", "Precaution 2"],
-            "remedies": ["Suggested remedies and home care, if available."],
-            "important_notes": "Any other important information or special considerations from the report, if available.",
-            "treatment_plan": "Suggested treatment and medications, if available.",
-            "lifestyle_changes": ["Lifestyle advice 1", "Lifestyle advice 2"],
-            "urgent_concerns": "Any urgent concerns or null."
-        }}
-        Report excerpt:
-        {text[:8000]}
-        """
+        Analyze the following medical report text and extract the information into a structured JSON format.
+        Be comprehensive but concise. If information for a field is not present, use `null` or an empty list `[]`.
+        Focus *only* on the information present in the text provided. Do not infer or add external knowledge.
 
-        logging.debug(f"Prompt being sent to Gemini: {prompt[:500]}...")  # Log the beginning of the prompt
+        JSON Format:
+        {{
+            "summary": "A concise summary of the main points of the medical report excerpt.",
+            "diagnosis": "Primary or potential diagnosis mentioned, or null.",
+            "key_findings": ["List key observations, test results, or findings mentioned.", "Finding 2", "..."],
+            "causes": ["Possible causes mentioned for the condition, or null.", "Cause 2", "..."],
+            "recommendations": "Specific medical recommendations or next steps mentioned, or null.",
+            "precautions": ["Any precautions advised in the text.", "Precaution 2", "..."],
+            "remedies": ["Mentioned treatments, therapies, or remedies.", "Remedy 2", "..."],
+            "important_notes": "Other significant details or notes from the report.",
+            "treatment_plan": "Outline of the treatment plan if described.",
+            "lifestyle_changes": ["Specific lifestyle changes suggested.", "Change 2", "..."],
+            "urgent_concerns": "Any explicitly mentioned urgent concerns or red flags, or null."
+        }}
+
+        Medical Report Text:
+        --- START TEXT ---
+        {text}
+        --- END TEXT ---
+
+        Provide *only* the JSON object as output, without any introductory text or markdown formatting.
+        """
 
         response = gemini_model.generate_content(prompt)
 
         if hasattr(response, "text"):
             response_text = response.text.strip()
-            logging.info(f"📝 Gemini Raw Response: {response_text[:500]}...")  # Log only the first 500 chars
-
-            json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+            json_match = re.search(r"```json\s*(\{.*?\})\s*```|(\{.*?\})", response_text, re.DOTALL)
             if json_match:
-                response_text = json_match.group(0).strip()
+                json_string = json_match.group(2) or json_match.group(1)
+                if json_string:
+                    try:
+                        structured_output = json.loads(json_string)
+                        logging.info(f"✅ Structured AI Summary Parsed Successfully.")
+                        return structured_output
+                    except json.JSONDecodeError as e:
+                        logging.error(f"❌ AI response failed JSON parsing (after regex): {e}\n--- JSON String Attempted ---\n{json_string}\n---")
+                        return {"error": "AI response could not be parsed as JSON", "raw_text": response_text}
+                else:
+                     logging.error("❌ Regex matched but failed to extract JSON content (Summary).")
+                     return {"error": "Regex matched but failed to extract JSON content.", "raw_text": response_text}
+            else:
+                try:
+                    structured_output = json.loads(response_text)
+                    logging.info(f"✅ Structured AI Summary Parsed Successfully (Direct Parse).")
+                    return structured_output
+                except json.JSONDecodeError as e_direct:
+                     logging.error(f"❌ No JSON block found or direct parse failed (Summary): {e_direct}\n--- Raw Text ---\n{response_text}\n---")
+                     return {"error": "No valid JSON found in AI response", "raw_text": response_text}
+        elif hasattr(response, 'candidates') and response.candidates:
+             # Handle potential blocks or empty responses
+             candidate = response.candidates[0]
+             if candidate.finish_reason != 'STOP':
+                  logging.error(f"❌ Gemini generation stopped unexpectedly. Reason: {candidate.finish_reason}")
+                  safety_ratings = getattr(candidate, 'safety_ratings', 'N/A')
+                  return {"error": f"AI generation failed or was blocked. Reason: {candidate.finish_reason}", "safety_ratings": safety_ratings}
+             else:
+                  # Try to get text if available even if .text wasn't top-level
+                  try:
+                      response_text = candidate.content.parts[0].text.strip()
+                      # Try parsing again
+                      # ... (add JSON parsing logic here as above) ...
+                      logging.warning("Gemini response had no top-level .text, but found text in candidate. Trying to parse.")
+                      # Reuse parsing logic... (this part needs duplication or refactoring)
+                      json_match = re.search(r"```json\s*(\{.*?\})\s*```|(\{.*?\})", response_text, re.DOTALL)
+                      # ... rest of parsing
+                      return {"error": "AI response structure unexpected, text found but parsing needs check."} # Placeholder
+                  except (AttributeError, IndexError):
+                      logging.error("❌ No 'text' attribute and couldn't extract from candidate parts.")
+                      return {"error": "No text content received from Gemini for summary."}
+        else:
+            logging.error("❌ Unexpected Gemini response structure (no text, no candidates).")
+            logging.debug(f"Full Gemini Response: {response}")
+            return {"error": "Unknown error or empty response from Gemini for summary."}
 
-            try:
-                structured_output = json.loads(response_text)
-                logging.info(f"✅ Structured AI Summary: {structured_output}")
-                return structured_output
-            except json.JSONDecodeError as e:
-                logging.error(f"❌ AI response is not valid JSON: {e}")
-                return {"error": "AI response is not structured JSON", "raw_text": response_text}
-
-        return {"error": "No response from Gemini."}
 
     except Exception as e:
-        logging.error(f"❌ Gemini API Error: {e}")
-        return {"error": "AI processing failed."}
+        logging.exception("❌ Unexpected error during Gemini text analysis:")
+        return {"error": f"Unexpected AI text processing error: {e}"}
+
+# --- Image Analysis Function (REVISED with better error handling) ---
+def analyze_image_with_gemini(image_data):
+    """Analyzes an image using Gemini AI and returns a structured JSON."""
+    try:
+        logging.info("🔄 Sending image to Gemini for analysis...")
+        prompt = """
+        YOUR **ONLY** OUTPUT MUST BE A VALID JSON OBJECT.
+        DO NOT INCLUDE ANY INTRODUCTORY TEXT, EXPLANATIONS, NOTES, OR MARKDOWN FORMATTING (like ```json) BEFORE OR AFTER THE JSON OBJECT.
+
+        The JSON object MUST conform EXACTLY to the following format. If you cannot determine a value for a particular field, set it to null or an empty list [] if it's an array.
+
+        JSON Format:
+        {
+            "summary": "Provide a DETAILED and COMPREHENSIVE summary explaining the primary medical issue or abnormality visible in the image. Synthesize the key findings into a coherent description of the problem. Include observations about location, extent, appearance, and relationship to surrounding structures.",
+            "diagnosis": "Potential diagnosis based *only* on the visual evidence in the image, if possible. Set to null if not determinable from the image alone.",
+            "key_findings": ["Finding 1", "Finding 2", "List all significant visual observations"],
+            "precautions": ["General precautions potentially relevant to findings, or null.", "Precaution 2"],
+            "remedies": ["Potential remedies/treatments suggested by visual findings, or null.", "Remedy 2"],
+            "urgent_concerns": "Any visually evident urgent concern or null.",
+            "anatomical_structures": ["Structure 1", "List main visible anatomical structures"]
+        }
+
+        Analyze the provided medical image and generate ONLY the JSON output based on the fields above. Ensure the 'summary' field is thorough.
+        """
+
+        try:
+            image = Image.open(BytesIO(image_data))
+            logging.info(f"Image loaded via PIL. Original format: {image.format}, Mode: {image.mode}, Size: {image.size}")
+            if image.mode != 'RGB':
+                logging.info(f"Converting image mode from {image.mode} to RGB.")
+                image = image.convert('RGB')
+
+            buffer = BytesIO()
+            # Reduce quality slightly to manage size if needed, adjust as necessary
+            image.save(buffer, format='JPEG', quality=85)
+            prepared_image_data = buffer.getvalue()
+            image_mime = 'image/jpeg'
+            logging.info(f"Image prepared for API as JPEG. Size: {len(prepared_image_data)} bytes.")
+
+        except Exception as img_err:
+            logging.error(f"❌ Failed to load/process image with PIL: {img_err}", exc_info=True)
+            return {"error": f"Failed to process image data: {img_err}"}
+
+        content = {
+            "parts": [
+                {"mime_type": image_mime, "data": prepared_image_data},
+                {"text": prompt}
+            ]
+        }
+
+        try:
+            response = gemini_model.generate_content(content)
+            logging.info(f"Received response object from Gemini for image analysis.")
+
+            if not response.candidates:
+                 logging.error("❌ Gemini response has no candidates. Likely blocked or error.")
+                 try:
+                      feedback = response.prompt_feedback
+                      logging.error(f"Prompt Feedback: {feedback}")
+                      block_reason = getattr(feedback, 'block_reason', 'Unknown (No candidates)')
+                      safety_ratings = getattr(feedback, 'safety_ratings', None)
+                      return {"error": f"Image analysis failed. Reason: {block_reason}", "safety_ratings": safety_ratings}
+                 except Exception as feedback_err:
+                      logging.error(f"Error accessing prompt feedback: {feedback_err}")
+                      return {"error": "Image analysis failed (No candidates received)."}
+
+            try:
+                 response_text = response.candidates[0].content.parts[0].text.strip()
+                 logging.info(f"📝 Gemini Raw Image Analysis Text received (length: {len(response_text)}).")
+
+            except (AttributeError, IndexError, TypeError) as e:
+                 logging.error(f"❌ Could not extract text from Gemini response structure: {e}")
+                 logging.debug(f"Full Gemini Response Candidate[0]: {response.candidates[0]}")
+                 # Check finish reason if text extraction failed
+                 finish_reason = getattr(response.candidates[0], 'finish_reason', 'UNKNOWN')
+                 if finish_reason != 'STOP':
+                      safety_ratings = getattr(response.candidates[0], 'safety_ratings', 'N/A')
+                      return {"error": f"AI generation stopped unexpectedly ({finish_reason}) before text could be extracted.", "safety_ratings": safety_ratings}
+                 return {"error": "Could not parse text content from Gemini response."}
+
+            json_match = re.search(r"```json\s*(\{.*?\})\s*```|(\{.*?\})", response_text, re.DOTALL)
+            if json_match:
+                json_string = json_match.group(2) or json_match.group(1)
+                if json_string:
+                    try:
+                        structured_output = json.loads(json_string)
+                        logging.info(f"✅ Structured Image Analysis Parsed Successfully (Regex).")
+                        return structured_output
+                    except json.JSONDecodeError as e:
+                        logging.error(f"❌ AI image response failed JSON parsing (after regex): {e}\n--- JSON String Attempted ---\n{json_string}\n---")
+                        return {"error": "AI image response contained invalid JSON structure", "raw_text": "See logs for raw text"}
+                else:
+                     logging.error("❌ Regex matched but failed to extract JSON content (Image Analysis).")
+                     return {"error": "Regex matched but failed to extract JSON content.", "raw_text": "See logs for raw text"}
+            else:
+                try:
+                    structured_output = json.loads(response_text)
+                    logging.info(f"✅ Structured Image Analysis Parsed Successfully (Direct Parse).")
+                    return structured_output
+                except json.JSONDecodeError as e_direct:
+                     logging.error(f"❌ No JSON block found or direct parse failed (Image Analysis): {e_direct}")
+                     logging.debug(f"--- Raw Response Text (Direct Parse Fail) ---\n{response_text}\n---")
+                     return {"error": "No valid JSON found in AI image response", "raw_text": "See logs for raw text"}
+
+        except Exception as api_err:
+            logging.exception("❌ Error during Gemini API call for image analysis:")
+            return {"error": f"Gemini API communication error: {api_err}"}
 
 
-def GeminiSummaryComponent(text):
-    data = analyze_text_with_gemini(text)
+    except Exception as e:
+        logging.exception("❌ Unexpected error during Gemini image analysis setup:")
+        return {"error": f"Unexpected AI image processing error: {e}"}
 
-    if "error" in data:
-        logging.error(f"Gemini Summary Component Error: {data['error']}")
-        return {"error": data["error"]}
-
-    summary_data = {
-        "Summary": data.get("summary", "N/A"),
-        "Diagnosis": data.get("diagnosis", "N/A"),
-        "Key Findings": ", ".join(data.get("key_findings", [])),
-        "Causes": ", ".join(data.get("causes", [])),
-        "Recommendations": data.get("recommendations", "N/A"),
-        "Precautions": ", ".join(data.get("precautions", [])),
-        "Remedies": ", ".join(data.get("remedies", [])),
-        "Important Notes": data.get("important_notes", "N/A"),
-        "Treatment Plan": data.get("treatment_plan", "N/A"),
-        "Lifestyle Changes": ", ".join(data.get("lifestyle_changes", [])),
-        "Urgent Concerns": data.get("urgent_concerns", "N/A"),
-    }
-
-    return summary_data
-
+# --- Chat Functions ---
+# --- REMOVED global chat_session and chat_history ---
+# --- The chat logic is now self-contained in the /api/chat route ---
 
 # -------------------- Flask Routes --------------------
 
 @app.route("/upload", methods=["POST"])
 def upload_file():
-    """Upload a file and save it to the server."""
+    """Upload a file, save it, and clear previous document context."""
     if "file" not in request.files:
+        logging.warning("Upload attempt with no file part.")
         return jsonify({"error": "No file part"}), 400
 
     file = request.files["file"]
     if file.filename == "":
+        logging.warning("Upload attempt with no selected file.")
         return jsonify({"error": "No selected file"}), 400
 
-    file_path = os.path.join(app.config["UPLOAD_FOLDER"], file.filename)
-    file.save(file_path)
-    logging.info(f"✅ File uploaded: {file_path}")
+    # Consider sanitizing filename in production:
+    # from werkzeug.utils import secure_filename
+    # filename = secure_filename(file.filename)
+    filename = file.filename
+    file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
 
-    return jsonify({"message": "File uploaded successfully", "file_path": file_path}), 200
+    try:
+        file.save(file_path)
+        logging.info(f"✅ File uploaded: {file_path}")
+
+        # --- Clear previous document context on new upload ---
+        session.pop('last_analyzed_text', None)
+        session.pop('last_analyzed_filename', None)
+        logging.info("Cleared previous document context from session due to new upload.")
+        # --- End context clearing ---
+
+        return jsonify({"message": "File uploaded successfully", "file_path": file_path, "filename": filename}), 200
+    except Exception as e:
+        logging.error(f"❌ Failed to save uploaded file {filename}: {e}", exc_info=True)
+        return jsonify({"error": f"Failed to save file: {e}"}), 500
 
 
 @app.route("/analyze", methods=["POST"])
 def analyze_report():
-    """Analyze the uploaded medical report and return structured data."""
+    """Analyze the uploaded report (text or image) and store text context in session if applicable."""
     data = request.json
     file_path = data.get("file_path")
+    filename = data.get("filename") # Get filename passed from upload response
 
     if not file_path or not os.path.exists(file_path):
-        return jsonify({"error": "File not found"}), 400
+        logging.error(f"Analysis request for non-existent file: {file_path}")
+        return jsonify({"error": "File not found on server"}), 400
+    if not filename:
+        filename = os.path.basename(file_path) # Fallback if filename not in request
 
-    extracted_text = extract_text(file_path)
-    if not extracted_text.strip():
-        return jsonify({"error": "No readable text found"}), 400
+    ext = pathlib.Path(file_path).suffix.lower()
+    is_image = ext in [".png", ".jpg", ".jpeg", ".bmp", ".tiff"]
 
-    structured_summary = analyze_text_with_gemini(extracted_text)
+    analysis_result = {}
 
-    return jsonify(structured_summary), 200
+    # --- Clear any existing context before analysis ---
+    session.pop('last_analyzed_text', None)
+    session.pop('last_analyzed_filename', None)
+    logging.info("Cleared document context before starting new analysis.")
+    # ---
+
+    if is_image:
+        logging.info(f"Starting image analysis for: {filename}")
+        try:
+            with open(file_path, "rb") as image_file:
+                image_data = image_file.read()
+            analysis_result = analyze_image_with_gemini(image_data)
+            # No text context to store for images
+            logging.info(f"Image analysis complete for {filename}. No text context stored.")
+
+        except Exception as e:
+            logging.error(f"❌ Error reading/analyzing image {filename}: {e}", exc_info=True)
+            return jsonify({"error": f"Image analysis failed: {e}"}), 500
+    else:
+        # It's a text-based document (PDF, DOCX, XLSX, potentially OCR'd image text)
+        logging.info(f"Starting text extraction and analysis for: {filename}")
+        extracted_text = extract_text(file_path)
+
+        if not extracted_text or not extracted_text.strip():
+            logging.warning(f"No readable text found in {filename}")
+            # No context to store if extraction fails
+            return jsonify({"error": "No readable text could be extracted from the document."}), 400
+
+        # --- Store extracted text in session for chat context ---
+        session['last_analyzed_text'] = extracted_text
+        session['last_analyzed_filename'] = filename
+        logging.info(f"Stored extracted text from '{filename}' in session for contextual chat.")
+        # --- End storing context ---
+
+        # Perform the structured analysis on the extracted text
+        analysis_result = analyze_text_with_gemini(extracted_text)
+
+    # Return the structured analysis result
+    if "error" in analysis_result:
+       # Check if it was an AI error specifically
+       status_code = 500 if "AI" in analysis_result.get("error", "") or "Gemini" in analysis_result.get("error", "") else 400
+       # Log the raw text if available and parsing failed
+       if "raw_text" in analysis_result:
+           logging.error(f"Raw text from failed analysis: {analysis_result['raw_text']}")
+       return jsonify(analysis_result), status_code
+    else:
+       return jsonify(analysis_result), 200
 
 
-@app.route("/chat", methods=["POST"])
-def chat():
-    """Handle AI chatbot conversation."""
-    data = request.json
-    user_message = data.get("message", "").strip()
-
+@app.route("/api/chat", methods=["POST"])
+def chat_api():
+    """Handles chat messages, using document context from session if available."""
+    user_message = request.json.get("message")
     if not user_message:
-        return jsonify({"error": "Message cannot be empty"}), 400
+        logging.warning("Chat request with no message.")
+        return jsonify({"error": "No message provided"}), 400
 
-    ai_response = chat_with_model(user_message)
-    return jsonify({"response": ai_response})
+    # Retrieve document context from session
+    document_text = session.get('last_analyzed_text')
+    filename = session.get('last_analyzed_filename')
 
+    prompt_for_gemini = ""
+    max_context_chars = 50000 # Limit context sent to Gemini to avoid hitting token limits aggressively
+
+    try:
+        if document_text and filename:
+            logging.info(f"Chat query received. Using context from document: {filename}")
+            # Truncate context if it's very large
+            truncated_context = document_text
+            if len(document_text) > max_context_chars:
+                logging.warning(f"Document context length ({len(document_text)}) exceeds limit ({max_context_chars}), truncating for chat prompt.")
+                truncated_context = document_text[:max_context_chars] + "\n... [Content Truncated]"
+
+
+            # Construct prompt telling Gemini to use the context if relevant
+            prompt_for_gemini = f"""You are a helpful medical AI assistant. You have access to the content of a medical document named '{filename}'.
+
+            **Instructions:**
+            1. Answer the user's query below.
+            2. **Prioritize using the provided document context** if the query seems related to it. Clearly state if your answer comes from the document.
+            3. If the query is *not* related to the document context, answer it using your general medical knowledge.
+            4. If you are unsure or the document doesn't contain the answer, state that clearly.
+            5. Respond concisely and clearly. Use bullet points if appropriate.
+
+            **Document Context ('{filename}'):**
+            --- START CONTEXT ---
+            {truncated_context}
+            --- END CONTEXT ---
+
+            **User Query:** {user_message}
+            """
+        else:
+            logging.info("Chat query received. No document context in session.")
+            # Construct a general prompt
+            prompt_for_gemini = f"""You are a helpful medical AI assistant.
+            Answer the following user query using your general medical knowledge.
+            Respond concisely and clearly. Use bullet points if appropriate.
+
+            **User Query:** {user_message}
+            """
+
+        # Send the constructed prompt to Gemini
+        # Use generate_content for a single-turn response based on the prompt
+        logging.debug(f"Sending prompt to Gemini for chat (length: {len(prompt_for_gemini)} chars)")
+        response = gemini_model.generate_content(prompt_for_gemini)
+
+        # Process the response
+        if hasattr(response, "text"):
+            response_text = response.text
+            logging.info("Received chat response from Gemini.")
+            return jsonify({"response": response_text})
+        elif hasattr(response, 'candidates') and response.candidates:
+             candidate = response.candidates[0]
+             if candidate.finish_reason != 'STOP':
+                  logging.error(f"❌ Gemini chat generation stopped unexpectedly. Reason: {candidate.finish_reason}")
+                  safety_ratings = getattr(candidate, 'safety_ratings', 'N/A')
+                  return jsonify({"error": f"Chat generation failed or was blocked. Reason: {candidate.finish_reason}", "safety_ratings": safety_ratings}), 500
+             else:
+                  # Try to extract text if available
+                  try:
+                      response_text = candidate.content.parts[0].text.strip()
+                      logging.warning("Gemini chat response had no top-level .text, but found text in candidate.")
+                      return jsonify({"response": response_text})
+                  except (AttributeError, IndexError):
+                       logging.error("❌ No 'text' attribute and couldn't extract chat response from candidate parts.")
+                       return jsonify({"error": "No text content received from Gemini for chat."}), 500
+        else:
+            logging.error("❌ No 'text' or valid 'candidates' in Gemini chat response.")
+            logging.debug(f"Full Gemini Chat Response: {response}")
+            return jsonify({"error": "No text content received from Gemini for chat."}), 500
+
+    except Exception as e:
+        logging.exception("❌ Error during chat processing:") # Log full traceback
+        return jsonify({"error": f"An unexpected error occurred during chat: {e}"}), 500
 
 # -------------------- Run the Flask App --------------------
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    # Use host='0.0.0.0' to make it accessible on your network
+    # Use debug=False in production
+    app.run(debug=True, host='0.0.0.0', port=5000)
