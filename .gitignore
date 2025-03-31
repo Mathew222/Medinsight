@@ -2,6 +2,9 @@
 .env
 .env.local
 .env.*.local
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
 
 # Service account keys and sensitive credentials
 serviceAccountKey.json

@@ -13,15 +13,16 @@ import {
   enableIndexedDbPersistence,
   Timestamp 
 } from 'firebase/firestore';
+import { getStorage } from 'firebase/storage';
 
 // Your Firebase configuration
 const firebaseConfig = {
-  apiKey: "AIzaSyBmsW3NFlEZ8eggBy8uMaEEJC1eHXsk0N0",
-  authDomain: "sample-firebase-ai-app-4939f.firebaseapp.com",
-  projectId: "sample-firebase-ai-app-4939f",
-  storageBucket: "sample-firebase-ai-app-4939f.firebasestorage.app",
-  messagingSenderId: "994067816373",
-  appId: "1:994067816373:web:e8b8f3a3e082dd5bf6c3fc"
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID
 };
 
 // Initialize Firebase
@@ -30,6 +31,7 @@ const app = initializeApp(firebaseConfig);
 // Get Auth and Firestore instances
 export const auth = getAuth(app);
 export const db = getFirestore(app);
+export const storage = getStorage(app);
 
 // Enable offline persistence
 enableIndexedDbPersistence(db)
